@@ -1,198 +1,200 @@
-name: Build Kernel
+name: Kernel Builder
 on:
   workflow_dispatch:
+    inputs:
+      debug:
+        description: 'Enable debug mode'
+        required: false
+        default: 'false'
+
+env:
+  KERNEL_DIR: ${{ github.workspace }}/kernel
+  TOOLCHAIN_DIR: ${{ github.workspace }}/toolchains
+  ARTIFACT_NAME: kernel-${{ github.run_number }}
 
 jobs:
   build:
-    name: Build Kernel by ${{ github.actor }}
-    runs-on: ubuntu-latest
-    env:
-      KERNEL_WORKSPACE: ${{ github.workspace }}/kernel_workspace
+    name: Kernel Builder
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
 
     steps:
-    - uses: actions/checkout@v4
+    - name: Checkout Repository
+      uses: actions/checkout@v4
+      with:
+        submodules: recursive
+        fetch-depth: 1
 
-    - name: Parse Configuration
-      id: config
+    - name: Validate Configuration
+      id: config-validation
       run: |
-        # 使用更稳健的变量解析方法
+        # 严格验证配置文件格式
+        set -eo pipefail
+        required_vars=(
+          "KERNEL_SOURCE" 
+          "KERNEL_DEFCONFIG"
+          "CLANG_VERSION"
+          "TARGET_ARCH"
+        )
+
         while IFS='=' read -r key value; do
-          if [[ $key == [A-Z]* ]]; then
-            echo "${key}=${value}" >> $GITHUB_ENV
+          key=$(echo $key | tr -d '[:space:]')
+          if [[ " ${required_vars[@]} " =~ " $key " ]]; then
+            if [[ -z "${value}" ]]; then
+              echo "::error ::Empty value for required variable: $key"
+              exit 101
+            fi
+            echo "$key=${value//\"/}" >> $GITHUB_ENV
           fi
-        done < <(grep -vE '^#|^$' config.env)
+        done < <(grep -vE '^#|^$' config.env | sed 's/^[ \t]*//;s/[ \t]*$//')
+
+        # 验证defconfig存在性
+        if ! grep -q "CONFIG_EMBEDDED=y" configs/${{ env.KERNEL_DEFCONFIG }}; then
+          echo "::error ::Invalid defconfig file"
+          exit 102
+        fi
 
     - name: Setup Build Environment
       run: |
-        # 添加时间戳和清理目录
-        echo "BUILD_TIME=$(TZ=Asia/Shanghai date '+%Y%m%d-%H%M')" >> $GITHUB_ENV
-        echo "DEVICE=$(echo ${{ env.KERNEL_DEFCONFIG }} | sed -E 's!vendor/|(_defconfig|_user|-perf)!!g')" >> $GITHUB_ENV
-        
-        # 安装必要依赖项
+        set -x
         sudo apt-get update
+        # 安装完整编译依赖
         sudo apt-get install -y \
-          git ccache automake flex lzop bison gperf build-essential zip curl \
-          zlib1g-dev g++-multilib libxml2-utils bzip2 libbz2-dev squashfs-tools \
-          pngcrush schedtool dpkg-dev liblz4-tool make optipng maven libssl-dev \
-          libswitch-perl policycoreutils minicom bc libc6-dev-i386 lib32ncurses5-dev \
-          libx11-dev lib32z-dev libgl1-mesa-dev xsltproc unzip device-tree-compiler \
-          python2 python3 default-jdk
+          build-essential libncurses-dev bison flex libssl-dev \
+          libelf-dev dwarves zlib1g-dev python3-pip \
+          device-tree-compiler lzop gcc-multilib git-lfs \
+          jq xmlstarlet cpio bc rsync kmod
 
-        # 创建工作目录
-        mkdir -p ${{ env.KERNEL_WORKSPACE }}
-        [ -d "${{ env.KERNEL_WORKSPACE }}" ] || exit 1
+        # 配置交换空间防止OOM
+        sudo fallocate -l 8G /swapfile
+        sudo chmod 600 /swapfile
+        sudo mkswap /swapfile
+        sudo swapon /swapfile
 
-    - name: Setup Toolchains
+        # 配置缓存目录
+        mkdir -p ${{ env.TOOLCHAIN_DIR }}
+        sudo mount -t tmpfs -o size=8G tmpfs ${{ env.TOOLCHAIN_DIR }}
+
+    - name: Install Toolchains
+      timeout-minutes: 15
       run: |
-        cd ${{ env.KERNEL_WORKSPACE }}
-        
-        # 下载并验证Clang
-        clang_url="https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/master-kernel-build-2022/clang-${{ env.CLANG_VERSION }}.tar.gz"
-        wget -q --show-progress -O clang.tar.gz "$clang_url"
-        mkdir -p clang && tar xzf clang.tar.gz -C clang || exit 1
-
-        # 下载GCC工具链
-        declare -A toolchains=(
-          ["gcc-aosp"]="https://android.googlesource.com/platform/prebuilts/gcc/linux-x86/aarch64/aarch64-linux-android-4.9/+archive/android-12.1.0_r27.tar.gz"
-          ["gcc32-aosp"]="https://android.googlesource.com/platform/prebuilts/gcc/linux-x86/arm/arm-linux-androideabi-4.9/+archive/android-12.1.0_r27.tar.gz"
+        # 使用加速镜像下载工具链
+        declare -A CLANG_MIRRORS=(
+          ["r487747c"]="https://mirror.iscas.ac.cn/kernel-prebuilts/clang-r487747c.tar.gz"
+          ["r450784d"]="https://mirror.ustc.edu.cn/android-kernel/clang-r450784d.tgz"
         )
-        for dir in "${!toolchains[@]}"; do
-          mkdir -p $dir
-          wget -q --show-progress -O "${dir}.tar.gz" "${toolchains[$dir]}" 
-          tar xzf "${dir}.tar.gz" -C "$dir" || exit 1
-        done
 
-    - name: Prepare Boot Tools
-      if: ${{ env.MAKE_BOOT_IMAGE == 'true' || env.BOOT_SIGNATURE == 'true' }}
-      run: |
-        cd ${{ env.KERNEL_WORKSPACE }}
-        
-        # 使用并行下载
-        (
-          if [ "${{ env.MAKE_BOOT_IMAGE }}" = "true" ]; then
-            git clone https://android.googlesource.com/platform/system/tools/mkbootimg tools -b master-kernel-build-2022 --depth=1
-          fi
-        ) &
-        
-        (
-          if [ "${{ env.BOOT_SIGNATURE }}" = "true" ]; then
-            git clone https://github.com/kindle4jerry/boot_signer_for_nubia_nx563j bootsigner -b main --depth=1
-          fi
-        ) &
-        
-        wait
+        cd ${{ env.TOOLCHAIN_DIR }}
+        if [ -n "${CLANG_MIRRORS[${{ env.CLANG_VERSION }}]}" ]; then
+          aria2c -x16 -s16 -k1M "${CLANG_MIRRORS[${{ env.CLANG_VERSION }}]}" -o clang.tar.gz
+        else
+          echo "::warning ::Using original clang source"
+          wget https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/master-kernel-build-2022/clang-${{ env.CLANG_VERSION }}.tar.gz
+        fi
+
+        tar --use-compress-program=pigz -xf clang.tar.gz
+        rm clang.tar.gz
+
+        # 验证编译器可用性
+        if ! ${{ env.TOOLCHAIN_DIR }}/clang/bin/clang --version; then
+          echo "::error ::Clang installation failed"
+          exit 103
+        fi
 
     - name: Clone Kernel Source
       run: |
-        cd ${{ env.KERNEL_WORKSPACE}}
-        git clone --depth=1 --branch "${{ env.KERNEL_SOURCE_BRANCH }}" "${{ env.KERNEL_SOURCE }}" android-kernel
-        [ -d "android-kernel" ] || { echo "❌ Kernel source clone failed"; exit 1; }
+        git clone \
+          --depth=1 \
+          --branch "${{ env.KERNEL_SOURCE_BRANCH }}" \
+          --filter=blob:none \
+          --sparse \
+          ${{ env.KERNEL_SOURCE }} ${{ env.KERNEL_DIR }}
 
-    - name: Handle Boot Image
-      if: ${{ env.MAKE_BOOT_IMAGE == 'true' }}
-      run: |
-        cd ${{ env.KERNEL_WORKSPACE}}
-        wget -q --show-progress -O boot-source.img "${{ env.SOURCE_BOOT_IMAGE}}"
-        
-        if [ ! -f "boot-source.img" ]; then
-          echo "::error ::Boot image download failed"
-          exit 1
-        fi
-        
-        # 提取引导参数
-        mkdir -p boot-unpacked
-        python3 tools/unpack_bootimg.py --boot_img boot-source.img --out boot-unpacked
-        echo "FORMAT_MKBOOTING=$(grep 'mkbootimg_args' boot-unpacked/header | cut -d= -f2)" >> $GITHUB_ENV
+        cd ${{ env.KERNEL_DIR }}
+        git sparse-checkout init --cone
+        git sparse-checkout set arch/${{ env.TARGET_ARCH }} drivers include
 
-    - name: Apply KernelSU
+    - name: Apply Patches
       if: ${{ env.USE_KERNELSU == 'true' }}
       run: |
-        cd ${{ env.KERNEL_WORKSPACE}}/android-kernel
-        curl -sLS https://raw.githubusercontent.com/tiann/KernelSU/main/kernel/setup.sh | bash -s main
-        echo "BUILD_TAG=+KSU" >> $GITHUB_ENV
-
-    - name: Compile Kernel
-      env:
-        MAKE_FLAGS: "-j$(($(nproc) + 1))"
-      run: |
-        cd ${{ env.KERNEL_WORKSPACE}}/android-kernel
-        
-        export PATH="${{ env.KERNEL_WORKSPACE}}/clang/bin:$PATH"
-        export KBUILD_BUILD_VERSION="1.0.0"
-        export KBUILD_BUILD_TIMESTAMP=$(date +%s)
-        
-        # 配置编译环境
-        make O=out ARCH=${{ env.TARGET_ARCH }} \
-          CC="clang" \
-          CLANG_TRIPLE=aarch64-linux-gnu- \
-          CROSS_COMPILE=${{ env.KERNEL_WORKSPACE }}/gcc-aosp/bin/aarch64-linux-android- \
-          CROSS_COMPILE_ARM32=${{ env.KERNEL_WORKSPACE }}/gcc32-aosp/bin/arm-linux-androideabi- \
-          LD=ld.lld \
-          ${{ env.BUILD_EXTRA_COMMAND }} \
-          ${{ env.KERNEL_DEFCONFIG }}
-
-        # 执行编译
-        make O=out ARCH=${{ env.TARGET_ARCH }} \
-          ${{ env.MAKE_FLAGS }} \
-          CC="clang" \
-          CLANG_TRIPLE=aarch64-linux-gnu- \
-          CROSS_COMPILE=${{ env.KERNEL_WORKSPACE }}/gcc-aosp/bin/aarch64-linux-android- \
-          CROSS_COMPILE_ARM32=${{ env.KERNEL_WORKSPACE }}/gcc32-aosp/bin/arm-linux-androideabi- \
-          LD=ld.lld \
-          ${{ env.BUILD_EXTRA_COMMAND }}
-
-        # 验证编译产物
-        [ -f "out/arch/${{ env.TARGET_ARCH }}/boot/${{ env.KERNEL_FILE }}" ] || { echo "❌ Kernel build failed"; exit 1; }
-
-    - name: Package Boot Images
-      if: ${{ env.MAKE_BOOT_IMAGE == 'true' }}
-      run: |
-        cd ${{ env.KERNEL_WORKSPACE}}
-        KERNEL_IMAGE="android-kernel/out/arch/${{ env.TARGET_ARCH }}/boot/${{ env.KERNEL_FILE}}"
-        
-        # 生成标准引导镜像
-        python3 tools/mkbootimg.py ${{ env.FORMAT_MKBOOTING }} \
-          --kernel "$KERNEL_IMAGE" \
-          -o boot-unsigned.img
-          
-        # 生成调试版引导镜像
-        python3 tools/mkbootimg.py ${{ env.FORMAT_MKBOOTING }} \
-          --kernel "$KERNEL_IMAGE" \
-          --ramdisk boot-unpacked/ramdisk \
-          --cmdline "$(echo ${{ env.FORMAT_MKBOOTING }} | grep -o '--cmdline [^ ]*' | cut -d' ' -f2) androidboot.selinux=permissive" \
-          -o boot-permissive-unsigned.img
-
-    - name: Sign Boot Images
-      if: ${{ env.BOOT_SIGNATURE == 'true' }}
-      run: |
-        cd ${{ env.KERNEL_WORKSPACE}}
-        
-        # 签名标准镜像
-        java -jar bootsigner/boot_signer.jar \
-          /boot boot-unsigned.img \
-          bootsigner/verity.pk8 bootsigner/verity.x509.pem \
-          boot-${{ env.DEVICE }}.img
-          
-        # 签名调试镜像
-        java -jar bootsigner/boot_signer.jar \
-          /boot boot-permissive-unsigned.img \
-          bootsigner/verity.pk8 bootsigner/verity.x509.pem \
-          boot-${{ env.DEVICE }}-permissive.img
-          
-        # 验证签名
-        for img in boot-*.img; do
-          if ! java -jar bootsigner/boot_signer.jar -verify $img | grep -q "VALID"; then
-            echo "::error ::Invalid signature for $img"
-            exit 1
+        cd ${{ env.KERNEL_DIR }}
+        curl -sL https://raw.githubusercontent.com/tiann/KernelSU/main/kernel/setup.sh | bash -
+        for p in patches/*.patch; do
+          if ! patch -p1 --no-backup-if-mismatch < $p; then
+            echo "::error ::Patch failed: $p"
+            exit 104
           fi
         done
+
+    - name: Build Kernel
+      env:
+        LLVM: 1
+        CC: clang
+        LD: ld.lld
+        AR: llvm-ar
+        NM: llvm-nm
+        OBJCOPY: llvm-objcopy
+        OBJDUMP: llvm-objdump
+        STRIP: llvm-strip
+      run: |
+        cd ${{ env.KERNEL_DIR }}
+        make O=out ARCH=${{ env.TARGET_ARCH }} ${{ env.KERNEL_DEFCONFIG }}
+
+        # 内存优化编译参数
+        make -j$(($(nproc)*2)) O=out ARCH=${{ env.TARGET_ARCH }} \
+          CROSS_COMPILE=aarch64-linux-gnu- \
+          CROSS_COMPILE_ARM32=arm-linux-gnueabi- \
+          CC="${{ env.TOOLCHAIN_DIR }}/clang/bin/clang" \
+          LD="${{ env.TOOLCHAIN_DIR }}/clang/bin/ld.lld" \
+          CLANG_TRIPLE=aarch64-linux-gnu- \
+          NM="${{ env.TOOLCHAIN_DIR }}/clang/bin/llvm-nm" \
+          AR="${{ env.TOOLCHAIN_DIR }}/clang/bin/llvm-ar" \
+          STRIP="${{ env.TOOLCHAIN_DIR }}/clang/bin/llvm-strip" \
+          OBJCOPY="${{ env.TOOLCHAIN_DIR }}/clang/bin/llvm-objcopy" \
+          OBJDUMP="${{ env.TOOLCHAIN_DIR }}/clang/bin/llvm-objdump" \
+          KCFLAGS="-pipe -Wno-maybe-uninitialized" \
+          KCPPFLAGS="-D__OPTIMIZE__=1" \
+          || ( cat out/.config && exit 1 )
+
+        # 验证产物完整性
+        if ! file out/arch/${{ env.TARGET_ARCH }}/boot/${{ env.KERNEL_FILE }} | grep -q 'Linux kernel'; then
+          echo "::error ::Invalid kernel image"
+          exit 105
+        fi
+
+    - name: Generate Boot Images
+      if: ${{ env.MAKE_BOOT_IMAGE == 'true' }}
+      run: |
+        python3 mkbootimg.py \
+          --kernel ${{ env.KERNEL_DIR }}/out/arch/${{ env.TARGET_ARCH }}/boot/${{ env.KERNEL_FILE }} \
+          --ramdisk initramfs.cpio \
+          --cmdline 'console=ttyMSM0,115200n8 earlycon=msm_geni_serial,0x4a90000' \
+          --base 0x80000000 \
+          --pagesize 4096 \
+          -o boot.img
+
+        # AVB签名验证
+        avbtool add_hash_footer \
+          --image boot.img \
+          --partition_name boot \
+          --partition_size $((64*1024*1024)) \
+          --algorithm SHA256_RSA4096 \
+          --key keys/verity.pk8 \
+          --prop com.android.build.boot.fingerprint:$(date +%s)
 
     - name: Upload Artifacts
       uses: actions/upload-artifact@v4
       with:
-        name: kernel-${{ env.DEVICE }}-${{ env.BUILD_TIME }}${{ env.BUILD_TAG }}
+        name: ${{ env.ARTIFACT_NAME }}
         path: |
-          ${{ env.KERNEL_WORKSPACE }}/android-kernel/out/arch/${{ env.TARGET_ARCH }}/boot/${{ env.KERNEL_FILE }}
-          ${{ env.KERNEL_WORKSPACE }}/boot-*.img
-        compression-level: 9
+          ${{ env.KERNEL_DIR }}/out/arch/${{ env.TARGET_ARCH }}/boot/*
+          boot.img
+        retention-days: 7
         if-no-files-found: error
+
+    - name: Cleanup
+      if: always()
+      run: |
+        sudo swapoff /swapfile
+        sudo rm /swapfile
+        sudo umount ${{ env.TOOLCHAIN_DIR }}
