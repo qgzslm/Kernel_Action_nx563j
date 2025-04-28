@@ -6,150 +6,193 @@ jobs:
   build:
     name: Build Kernel by ${{ github.actor }}
     runs-on: ubuntu-latest
+    env:
+      KERNEL_WORKSPACE: ${{ github.workspace }}/kernel_workspace
+
     steps:
-    - uses: actions/checkout@v3
+    - uses: actions/checkout@v4
 
-    - name: Setup Configuration
+    - name: Parse Configuration
+      id: config
       run: |
-        echo "KERNEL_SOURCE=$(grep "KERNEL_SOURCE" config.env | cut -d "=" -f 2)" >> $GITHUB_ENV
-        echo "KERNEL_SOURCE_BRANCH=$(grep "KERNEL_SOURCE_BRANCH" config.env | cut -d "=" -f 2)" >> $GITHUB_ENV
-        echo "KERNEL_DEFCONFIG=$(grep "KERNEL_DEFCONFIG" config.env | cut -d "=" -f 2)" >> $GITHUB_ENV
-        echo "TARGET_ARCH=$(grep "TARGET_ARCH" config.env | cut -d "=" -f 2)" >> $GITHUB_ENV
-        echo "KERNEL_FILE=$(grep "KERNEL_FILE" config.env | cut -d "=" -f 2)" >> $GITHUB_ENV
-        echo "CLANG_VERSION=$(grep "CLANG_VERSION" config.env | cut -d "=" -f 2)" >> $GITHUB_ENV
-        echo "BUILD_EXTRA_COMMAND=$(grep "EXTRA_BUILD_COMMAND" config.env | cut -d "=" -f 2)" >> $GITHUB_ENV
-        echo "USE_KERNELSU=$(grep "USE_KERNELSU" config.env | cut -d "=" -f 2)" >> $GITHUB_ENV
-        echo "MAKE_BOOT_IMAGE=$(grep "MAKE_BOOT_IMAGE" config.env | cut -d "=" -f 2)" >> $GITHUB_ENV
-        echo "BOOT_SIGNATURE=$(grep "BOOT_SIGNATURE" config.env | cut -d "=" -f 2)" >> $GITHUB_ENV
-        echo "SOURCE_BOOT_IMAGE=$(grep "SOURCE_BOOT_IMAGE" config.env | cut -d "=" -f 2)" >> $GITHUB_ENV
+        # 使用更稳健的变量解析方法
+        while IFS='=' read -r key value; do
+          if [[ $key == [A-Z]* ]]; then
+            echo "${key}=${value}" >> $GITHUB_ENV
+          fi
+        done < <(grep -vE '^#|^$' config.env)
 
-    - name: Setup build kernel environment
+    - name: Setup Build Environment
       run: |
-        echo "BUILD_TIME=$(TZ=Asia/Shanghai date "+%Y%m%d%H%M")" >> $GITHUB_ENV
-        echo "DEVICE=$(echo ${{ env.KERNEL_DEFCONFIG }} | sed 's!vendor/!!;s/_defconfig//;s/_user//;s/-perf//')" >> $GITHUB_ENV
-        sudo apt-get update
-        sudo apt-get install -y git ccache automake flex lzop bison gperf build-essential zip curl zlib1g-dev \
-        g++-multilib libxml2-utils bzip2 libbz2-dev libghc-bzlib-dev squashfs-tools pngcrush schedtool dpkg-dev \
-        liblz4-tool make optipng maven libssl-dev pwgen libswitch-perl policycoreutils minicom \
-        libxml-sax-base-perl libxml-simple-perl bc libc6-dev-i386 lib32ncurses5-dev libx11-dev lib32z-dev \
-        libgl1-mesa-dev xsltproc unzip device-tree-compiler python2 python3 default-jdk
-        mkdir -p $GITHUB_WORKSPACE/kernel_workspace
-
-    - name: Download Clang-aosp Gcc-aosp Gcc32-aosp
-      run: |
-        cd $GITHUB_WORKSPACE/kernel_workspace
-        mkdir clang-aosp
-        wget https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/master-kernel-build-2022/clang-${{ env.CLANG_VERSION }}.tar.gz
-        tar -C clang-aosp/ -zxvf clang-${{ env.CLANG_VERSION }}.tar.gz
-        mkdir gcc-aosp
-        wget https://android.googlesource.com/platform/prebuilts/gcc/linux-x86/aarch64/aarch64-linux-android-4.9/+archive/refs/tags/android-12.1.0_r27.tar.gz -O gcc-aosp.tar.gz
-        tar -C gcc-aosp/ -zxvf gcc-aosp.tar.gz
-        mkdir gcc32-aosp
-        wget https://android.googlesource.com/platform/prebuilts/gcc/linux-x86/arm/arm-linux-androideabi-4.9/+archive/refs/tags/android-12.1.0_r27.tar.gz -O gcc32-aosp.tar.gz
-        tar -C gcc32-aosp/ -zxvf gcc32-aosp.tar.gz
-
-    - name: Download mkbootimg tools
-      if: env.MAKE_BOOT_IMAGE == 'true'
-      run: |
-        cd $GITHUB_WORKSPACE/kernel_workspace
-        git clone https://android.googlesource.com/platform/system/tools/mkbootimg tools -b master-kernel-build-2022 --depth=1
-
-    - name: Download boot signer tools
-      if: env.BOOT_SIGNATURE == 'true'
-      run: |
-        cd $GITHUB_WORKSPACE/kernel_workspace
-        git clone https://github.com/kindle4jerry/boot_signer_for_nubia_nx563j bootsigner -b main --depth=1
-
-    - name: Download kernel source
-      run: |
-        cd $GITHUB_WORKSPACE/kernel_workspace
-        git clone ${{ env.KERNEL_SOURCE }} -b ${{ env.KERNEL_SOURCE_BRANCH }} android-kernel --depth=1
-
-    - name: Download source boot image
-      if: env.MAKE_BOOT_IMAGE == 'true'
-      run: |
-        cd $GITHUB_WORKSPACE/kernel_workspace
-        wget -O boot-source.img "${{ env.SOURCE_BOOT_IMAGE }}"
-        if [ -f boot-source.img ]; then
-            echo "FORMAT_MKBOOTING=$(tools/unpack_bootimg.py --boot_img=boot-source.img --format mkbootimg)" >> $GITHUB_ENV
-            echo "HAVE_SOURCE_BOOT_IMAGE=true" >> $GITHUB_ENV
-        else
-            echo "Source boot image download failed"
-            exit 1
-        fi
-
-    - name: Setup KernelSU
-      if: env.USE_KERNELSU == 'true'
-      run: |
-        cd $GITHUB_WORKSPACE/kernel_workspace/android-kernel
-        curl -LSs "https://raw.githubusercontent.com/tiann/KernelSU/main/kernel/setup.sh" | bash -
-        echo "UPLOADNAME=-KernelSU" >> $GITHUB_ENV
-
-    - name: Build kernel
-      run: |
-        cd $GITHUB_WORKSPACE/kernel_workspace/android-kernel
-        export PATH="$GITHUB_WORKSPACE/kernel_workspace/clang-aosp/bin:$PATH"
-        export KBUILD_BUILD_HOST="Github-Action"
-        export KBUILD_BUILD_USER="${{ github.actor }}"
-        make -j$(nproc --all) O=out ARCH=${{ env.TARGET_ARCH }} \
-        CLANG_TRIPLE=aarch64-linux-gnu- \
-        CROSS_COMPILE=$GITHUB_WORKSPACE/kernel_workspace/gcc-aosp/bin/aarch64-linux-android- \
-        CROSS_COMPILE_ARM32=$GITHUB_WORKSPACE/kernel_workspace/gcc32-aosp/bin/arm-linux-androideabi- \
-        CC=clang ${{ env.BUILD_EXTRA_COMMAND }} ${{ env.KERNEL_DEFCONFIG }}
+        # 添加时间戳和清理目录
+        echo "BUILD_TIME=$(TZ=Asia/Shanghai date '+%Y%m%d-%H%M')" >> $GITHUB_ENV
+        echo "DEVICE=$(echo ${{ env.KERNEL_DEFCONFIG }} | sed -E 's!vendor/|(_defconfig|_user|-perf)!!g')" >> $GITHUB_ENV
         
-        make -j$(nproc --all) O=out ARCH=${{ env.TARGET_ARCH }} \
-        CLANG_TRIPLE=aarch64-linux-gnu- \
-        CROSS_COMPILE=$GITHUB_WORKSPACE/kernel_workspace/gcc-aosp/bin/aarch64-linux-android- \
-        CROSS_COMPILE_ARM32=$GITHUB_WORKSPACE/kernel_workspace/gcc32-aosp/bin/arm-linux-androideabi- \
-        CC=clang ${{ env.BUILD_EXTRA_COMMAND }}
+        # 安装必要依赖项
+        sudo apt-get update
+        sudo apt-get install -y \
+          git ccache automake flex lzop bison gperf build-essential zip curl \
+          zlib1g-dev g++-multilib libxml2-utils bzip2 libbz2-dev squashfs-tools \
+          pngcrush schedtool dpkg-dev liblz4-tool make optipng maven libssl-dev \
+          libswitch-perl policycoreutils minicom bc libc6-dev-i386 lib32ncurses5-dev \
+          libx11-dev lib32z-dev libgl1-mesa-dev xsltproc unzip device-tree-compiler \
+          python2 python3 default-jdk
 
-    - name: Make boot image
-      if: env.HAVE_SOURCE_BOOT_IMAGE == 'true'
+        # 创建工作目录
+        mkdir -p ${{ env.KERNEL_WORKSPACE }}
+        [ -d "${{ env.KERNEL_WORKSPACE }}" ] || exit 1
+
+    - name: Setup Toolchains
       run: |
-        cd $GITHUB_WORKSPACE/kernel_workspace
-        mkdir -p out
-        tools/unpack_bootimg.py --boot_img boot-source.img --out out
-        cp android-kernel/out/arch/${{ env.TARGET_ARCH }}/boot/${{ env.KERNEL_FILE }} out/kernel
-        tools/mkbootimg.py ${{ env.FORMAT_MKBOOTING }} -o boot_unsign.img
-        [ -f boot_unsign.img ] && echo "MAKE_BOOT_IMAGE_IS_OK=true" >> $GITHUB_ENV
+        cd ${{ env.KERNEL_WORKSPACE }}
+        
+        # 下载并验证Clang
+        clang_url="https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/master-kernel-build-2022/clang-${{ env.CLANG_VERSION }}.tar.gz"
+        wget -q --show-progress -O clang.tar.gz "$clang_url"
+        mkdir -p clang && tar xzf clang.tar.gz -C clang || exit 1
 
-        # Create permissive boot image
-        tools/mkbootimg.py \
-        --header_version 0 \
-        --os_version 13.0.0 \
-        --os_patch_level 2023-01 \
-        --kernel out/kernel \
-        --ramdisk out/ramdisk \
-        --pagesize 0x00001000 \
-        --base 0x00000000 \
-        --kernel_offset 0x00008000 \
-        --ramdisk_offset 0x00000000 \
-        --second_offset 0x00000000 \
-        --tags_offset 0x00000100 \
-        --board '' \
-        --cmdline 'androidboot.hardware=qcom user_debug=31 msm_rtb.filter=0x37 ehci-hcd.park=3 lpm_levels.sleep_disabled=1 sched_enable_hmp=1 sched_enable_power_aware=1 service_locator.enable=1 swiotlb=2048 androidboot.usbconfigfs=true androidboot.usbcontroller=a800000.dwc3 androidboot.selinux=permissive loop.max_part=7 buildvariant=userdebug veritykeyid=id:7e4333f9bba00adfe0ede979e28ed1920492b40f' \
-        -o bootp_unsign.img
-        [ -f bootp_unsign.img ] && echo "MAKE_BOOTP_IMAGE_IS_OK=true" >> $GITHUB_ENV
+        # 下载GCC工具链
+        declare -A toolchains=(
+          ["gcc-aosp"]="https://android.googlesource.com/platform/prebuilts/gcc/linux-x86/aarch64/aarch64-linux-android-4.9/+archive/android-12.1.0_r27.tar.gz"
+          ["gcc32-aosp"]="https://android.googlesource.com/platform/prebuilts/gcc/linux-x86/arm/arm-linux-androideabi-4.9/+archive/android-12.1.0_r27.tar.gz"
+        )
+        for dir in "${!toolchains[@]}"; do
+          mkdir -p $dir
+          wget -q --show-progress -O "${dir}.tar.gz" "${toolchains[$dir]}" 
+          tar xzf "${dir}.tar.gz" -C "$dir" || exit 1
+        done
 
-    - name: Boot Signature
-      if: env.BOOT_SIGNATURE == 'true'
+    - name: Prepare Boot Tools
+      if: ${{ env.MAKE_BOOT_IMAGE == 'true' || env.BOOT_SIGNATURE == 'true' }}
       run: |
-        cd $GITHUB_WORKSPACE/kernel_workspace
-        java -jar bootsigner/boot_signer.jar /boot boot_unsign.img bootsigner/verity.pk8 bootsigner/verity.x509.pem boot.img
-        if java -jar bootsigner/boot_signer.jar -verify boot.img | grep -q "VALID"; then
-          echo "BOOT_SIGNATURE_VALID=true" >> $GITHUB_ENV
-        fi
+        cd ${{ env.KERNEL_WORKSPACE }}
+        
+        # 使用并行下载
+        (
+          if [ "${{ env.MAKE_BOOT_IMAGE }}" = "true" ]; then
+            git clone https://android.googlesource.com/platform/system/tools/mkbootimg tools -b master-kernel-build-2022 --depth=1
+          fi
+        ) &
+        
+        (
+          if [ "${{ env.BOOT_SIGNATURE }}" = "true" ]; then
+            git clone https://github.com/kindle4jerry/boot_signer_for_nubia_nx563j bootsigner -b main --depth=1
+          fi
+        ) &
+        
+        wait
 
-        java -jar bootsigner/boot_signer.jar /boot bootp_unsign.img bootsigner/verity.pk8 bootsigner/verity.x509.pem boot_permissive.img
-        if java -jar bootsigner/boot_signer.jar -verify boot_permissive.img | grep -q "VALID"; then
-          echo "BOOTP_SIGNATURE_VALID=true" >> $GITHUB_ENV
-        fi
+    - name: Clone Kernel Source
+      run: |
+        cd ${{ env.KERNEL_WORKSPACE}}
+        git clone --depth=1 --branch "${{ env.KERNEL_SOURCE_BRANCH }}" "${{ env.KERNEL_SOURCE }}" android-kernel
+        [ -d "android-kernel" ] || { echo "❌ Kernel source clone failed"; exit 1; }
 
-    - name: Upload boot image
-      if: env.MAKE_BOOT_IMAGE_IS_OK == 'true' && env.BOOT_SIGNATURE_VALID == 'true'
+    - name: Handle Boot Image
+      if: ${{ env.MAKE_BOOT_IMAGE == 'true' }}
+      run: |
+        cd ${{ env.KERNEL_WORKSPACE}}
+        wget -q --show-progress -O boot-source.img "${{ env.SOURCE_BOOT_IMAGE}}"
+        
+        if [ ! -f "boot-source.img" ]; then
+          echo "::error ::Boot image download failed"
+          exit 1
+        fi
+        
+        # 提取引导参数
+        mkdir -p boot-unpacked
+        python3 tools/unpack_bootimg.py --boot_img boot-source.img --out boot-unpacked
+        echo "FORMAT_MKBOOTING=$(grep 'mkbootimg_args' boot-unpacked/header | cut -d= -f2)" >> $GITHUB_ENV
+
+    - name: Apply KernelSU
+      if: ${{ env.USE_KERNELSU == 'true' }}
+      run: |
+        cd ${{ env.KERNEL_WORKSPACE}}/android-kernel
+        curl -sLS https://raw.githubusercontent.com/tiann/KernelSU/main/kernel/setup.sh | bash -s main
+        echo "BUILD_TAG=+KSU" >> $GITHUB_ENV
+
+    - name: Compile Kernel
+      env:
+        MAKE_FLAGS: "-j$(($(nproc) + 1))"
+      run: |
+        cd ${{ env.KERNEL_WORKSPACE}}/android-kernel
+        
+        export PATH="${{ env.KERNEL_WORKSPACE}}/clang/bin:$PATH"
+        export KBUILD_BUILD_VERSION="1.0.0"
+        export KBUILD_BUILD_TIMESTAMP=$(date +%s)
+        
+        # 配置编译环境
+        make O=out ARCH=${{ env.TARGET_ARCH }} \
+          CC="clang" \
+          CLANG_TRIPLE=aarch64-linux-gnu- \
+          CROSS_COMPILE=${{ env.KERNEL_WORKSPACE }}/gcc-aosp/bin/aarch64-linux-android- \
+          CROSS_COMPILE_ARM32=${{ env.KERNEL_WORKSPACE }}/gcc32-aosp/bin/arm-linux-androideabi- \
+          LD=ld.lld \
+          ${{ env.BUILD_EXTRA_COMMAND }} \
+          ${{ env.KERNEL_DEFCONFIG }}
+
+        # 执行编译
+        make O=out ARCH=${{ env.TARGET_ARCH }} \
+          ${{ env.MAKE_FLAGS }} \
+          CC="clang" \
+          CLANG_TRIPLE=aarch64-linux-gnu- \
+          CROSS_COMPILE=${{ env.KERNEL_WORKSPACE }}/gcc-aosp/bin/aarch64-linux-android- \
+          CROSS_COMPILE_ARM32=${{ env.KERNEL_WORKSPACE }}/gcc32-aosp/bin/arm-linux-androideabi- \
+          LD=ld.lld \
+          ${{ env.BUILD_EXTRA_COMMAND }}
+
+        # 验证编译产物
+        [ -f "out/arch/${{ env.TARGET_ARCH }}/boot/${{ env.KERNEL_FILE }}" ] || { echo "❌ Kernel build failed"; exit 1; }
+
+    - name: Package Boot Images
+      if: ${{ env.MAKE_BOOT_IMAGE == 'true' }}
+      run: |
+        cd ${{ env.KERNEL_WORKSPACE}}
+        KERNEL_IMAGE="android-kernel/out/arch/${{ env.TARGET_ARCH }}/boot/${{ env.KERNEL_FILE}}"
+        
+        # 生成标准引导镜像
+        python3 tools/mkbootimg.py ${{ env.FORMAT_MKBOOTING }} \
+          --kernel "$KERNEL_IMAGE" \
+          -o boot-unsigned.img
+          
+        # 生成调试版引导镜像
+        python3 tools/mkbootimg.py ${{ env.FORMAT_MKBOOTING }} \
+          --kernel "$KERNEL_IMAGE" \
+          --ramdisk boot-unpacked/ramdisk \
+          --cmdline "$(echo ${{ env.FORMAT_MKBOOTING }} | grep -o '--cmdline [^ ]*' | cut -d' ' -f2) androidboot.selinux=permissive" \
+          -o boot-permissive-unsigned.img
+
+    - name: Sign Boot Images
+      if: ${{ env.BOOT_SIGNATURE == 'true' }}
+      run: |
+        cd ${{ env.KERNEL_WORKSPACE}}
+        
+        # 签名标准镜像
+        java -jar bootsigner/boot_signer.jar \
+          /boot boot-unsigned.img \
+          bootsigner/verity.pk8 bootsigner/verity.x509.pem \
+          boot-${{ env.DEVICE }}.img
+          
+        # 签名调试镜像
+        java -jar bootsigner/boot_signer.jar \
+          /boot boot-permissive-unsigned.img \
+          bootsigner/verity.pk8 bootsigner/verity.x509.pem \
+          boot-${{ env.DEVICE }}-permissive.img
+          
+        # 验证签名
+        for img in boot-*.img; do
+          if ! java -jar bootsigner/boot_signer.jar -verify $img | grep -q "VALID"; then
+            echo "::error ::Invalid signature for $img"
+            exit 1
+          fi
+        done
+
+    - name: Upload Artifacts
       uses: actions/upload-artifact@v4
       with:
-        name: boot-${{ env.DEVICE }}-${{ env.BUILD_TIME }}${{ env.UPLOADNAME }}
+        name: kernel-${{ env.DEVICE }}-${{ env.BUILD_TIME }}${{ env.BUILD_TAG }}
         path: |
-          $GITHUB_WORKSPACE/kernel_workspace/boot.img
-          $GITHUB_WORKSPACE/kernel_workspace/boot_permissive.img
+          ${{ env.KERNEL_WORKSPACE }}/android-kernel/out/arch/${{ env.TARGET_ARCH }}/boot/${{ env.KERNEL_FILE }}
+          ${{ env.KERNEL_WORKSPACE }}/boot-*.img
+        compression-level: 9
+        if-no-files-found: error
